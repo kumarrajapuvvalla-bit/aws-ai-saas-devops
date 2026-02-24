@@ -1,0 +1,77 @@
+# LESSON (Issue #5 + #6): OPA Gatekeeper enforces standards at admission time.
+# Engineers cannot accidentally bypass rules learned from production incidents.
+
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sminreplicacount
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sMinReplicaCount
+      validation:
+        openAPIV3Schema:
+          properties:
+            minReplicas:
+              type: integer
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sminreplicacount
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Deployment"
+          input.review.object.spec.replicas < input.parameters.minReplicas
+          msg := sprintf("Deployment '%v' has %v replica(s). Prod requires minimum %v.",
+            [input.review.object.metadata.name,
+             input.review.object.spec.replicas,
+             input.parameters.minReplicas])
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sMinReplicaCount
+metadata:
+  name: prod-min-2-replicas
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    namespaces: [inference, api, processing]
+  parameters:
+    minReplicas: 2
+
+---
+# CronJobs must have TTL — prevents etcd overload (Issue #6)
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8scronjobttl
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sCronJobTTL
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8scronjobrttl
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "CronJob"
+          not input.review.object.spec.jobTemplate.spec.ttlSecondsAfterFinished
+          msg := sprintf("CronJob '%v' missing ttlSecondsAfterFinished. Add it to prevent etcd overload.",
+            [input.review.object.metadata.name])
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sCronJobTTL
+metadata:
+  name: require-cronjob-ttl
+spec:
+  match:
+    kinds:
+      - apiGroups: ["batch"]
+        kinds: ["CronJob"]

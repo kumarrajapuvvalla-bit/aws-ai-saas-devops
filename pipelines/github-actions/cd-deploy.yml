@@ -1,0 +1,74 @@
+name: CD — Deploy via ArgoCD
+
+on:
+  workflow_run:
+    workflows: ["CI — Build, Test, Scan & Push"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  # Pre-flight: verify cluster is reachable BEFORE starting deploy
+  # LESSON (Issue #6): NSG change made API server unreachable.
+  # Without pre-flight, engineers discovered this 8 minutes into a deployment.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: eu-west-1
+      - run: aws eks update-kubeconfig --region eu-west-1 --name ai-saas-prod
+      - name: Pre-flight — EKS API server reachable
+        run: |
+          kubectl cluster-info --request-timeout=10s || {
+            echo "::error::EKS API unreachable — check VPC/SG config before deploying"
+            exit 1
+          }
+
+  deploy-production:
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: eu-west-1
+      - run: aws eks update-kubeconfig --region eu-west-1 --name ai-saas-prod
+
+      - name: Determine active colour
+        id: colour
+        run: |
+          ACTIVE=$(kubectl get service ai-inference-active -n inference \
+            -o jsonpath='{.spec.selector.colour}')
+          echo "deploy-colour=$([[ $ACTIVE == blue ]] && echo green || echo blue)" >> $GITHUB_OUTPUT
+          echo "standby-colour=$ACTIVE" >> $GITHUB_OUTPUT
+
+      - name: Deploy to inactive colour
+        run: |
+          helm upgrade --install ai-inference-${{ steps.colour.outputs.deploy-colour }} \
+            kubernetes/helm/ai-inference --namespace inference \
+            --set image.tag=sha-${{ github.sha }} \
+            --set colour=${{ steps.colour.outputs.deploy-colour }} \
+            -f kubernetes/helm/ai-inference/values-prod.yaml \
+            --atomic --timeout 10m
+
+      - name: Switch traffic
+        run: |
+          kubectl patch service ai-inference-active -n inference \
+            -p '{"spec":{"selector":{"colour":"${{ steps.colour.outputs.deploy-colour }}"}}}'
+
+      - name: Auto-cleanup standby (10min wait)
+        # LESSON (Issue #7): Manual "scale down blue" step was SKIPPED under
+        # release pressure. Blue + Green both held DB connections. Pool
+        # exhausted in 8 min. 34% error rate. Now this is AUTOMATED.
+        run: |
+          sleep 600
+          kubectl scale deployment ai-inference-${{ steps.colour.outputs.standby-colour }} \
+            --replicas=0 -n inference
+          echo "Standby scaled to 0 — DB connections freed"

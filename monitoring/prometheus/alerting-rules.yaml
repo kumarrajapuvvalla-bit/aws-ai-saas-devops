@@ -1,0 +1,71 @@
+# =============================================================================
+# LESSON (Issue #9): 340 noisy alerts → engineer bulk-acknowledged 12 alerts
+# on Saturday night → missed P0 payment failure (34% error rate) for 40 min.
+# Rule: SYMPTOM-BASED alerts only. Every alert must require an action.
+# 3-tier model: P0 (wake everyone), P1 (page on-call), P2 (Slack only).
+# =============================================================================
+
+groups:
+  # P0 — User-facing symptoms. Page on-call + backup + manager. Never noise.
+  - name: p0.user-facing
+    rules:
+      - alert: InferenceErrorRateCritical
+        expr: |
+          (sum(rate(http_requests_total{service="ai-inference",status=~"5.."}[5m]))
+           / sum(rate(http_requests_total{service="ai-inference"}[5m]))) > 0.05
+        for: 5m  # 5-min window eliminates transient spikes (Issue #9 fix)
+        labels:
+          severity: p0
+        annotations:
+          summary: "P0: Inference error rate {{ $value | humanizePercentage }}"
+          description: "Users seeing errors. Check pod logs and GPU status immediately."
+
+      - alert: AllReplicasDown
+        expr: kube_deployment_status_replicas_available == 0 and kube_deployment_spec_replicas > 0
+        for: 2m
+        labels:
+          severity: p0
+        annotations:
+          summary: "P0: Deployment {{ $labels.deployment }} has 0 available replicas"
+
+  # P1 — Degraded but not down. Page on-call.
+  - name: p1.degraded
+    rules:
+      - alert: GPUMemoryLeakDetected
+        # LESSON (Issue #7): Memory leak went 3 weeks undetected.
+        # Alert on growth RATE before it hits the OOMKill limit.
+        expr: increase(container_accelerator_memory_used_bytes{container="ai-inference"}[30m]) > 524288000
+        for: 5m
+        labels:
+          severity: p1
+        annotations:
+          summary: "P1: GPU memory growing >500MB in 30min on {{ $labels.pod }}"
+          description: "Likely memory leak. Pod will OOMKill without intervention."
+
+      - alert: SQSDeadLetterQueueGrowing
+        expr: aws_sqs_approximate_number_of_messages_visible{queue_name=~".*-dlq"} > 10
+        for: 5m
+        labels:
+          severity: p1
+        annotations:
+          summary: "P1: DLQ {{ $labels.queue_name }} has {{ $value }} messages"
+
+      - alert: EtcdDBSizeHigh
+        # LESSON (Issue #6): etcd grew to 7.2GB. kubectl: 9s response time.
+        expr: etcd_db_total_size_in_bytes > 5368709120
+        for: 15m
+        labels:
+          severity: p1
+        annotations:
+          summary: "P1: etcd {{ $value | humanizeBytes }} — check uncleaned CronJob pods"
+
+  # P2 — Slack only. Review next business day.
+  - name: p2.informational
+    rules:
+      - alert: TLSCertificateExpiringSoon
+        expr: certmanager_certificate_expiration_timestamp_seconds - time() < 86400 * 14
+        for: 1h
+        labels:
+          severity: p2
+        annotations:
+          summary: "P2: TLS cert {{ $labels.name }} expires in {{ $value | humanizeDuration }}"

@@ -1,0 +1,75 @@
+# =============================================================================
+# LESSON (Issue #5): No PDB + single replica = guaranteed downtime during
+# any node drain. kubelet evicted Prometheus (no PriorityClass) under GPU
+# memory pressure. Now: system pods are untouchable.
+# =============================================================================
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ai-inference-pdb
+  namespace: inference
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: ai-inference
+
+---
+# system-critical: Prometheus, Grafana, Fluent Bit — NEVER evicted
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: system-critical
+value: 1000000
+globalDefault: false
+description: "Critical system pods. Never evicted under node pressure."
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: workload-high
+value: 100000
+globalDefault: false
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: workload-batch
+value: 1000
+globalDefault: false
+description: "Batch jobs. First evicted under pressure."
+
+---
+# CronJob with mandatory TTL
+# LESSON (Issue #6): 28,000 completed pods with no TTL degraded etcd.
+# kubectl: 9 seconds response. OPA enforces TTL on every CronJob.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-retraining-job
+  namespace: processing
+spec:
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400  # REQUIRED — OPA rejects without this
+      template:
+        spec:
+          priorityClassName: workload-batch
+          restartPolicy: OnFailure
+          containers:
+            - name: retraining
+              image: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/model-retraining:latest
+              resources:
+                requests:
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  memory: "20Gi"  # model(12GB) + CUDA(4GB) + buffer = 20Gi (Issue #5)
+                  nvidia.com/gpu: "1"

@@ -1,0 +1,83 @@
+name: CI — Build, Test, Scan & Push
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # Required for OIDC — no static AWS keys (Issue #3 fix)
+  contents: read
+
+jobs:
+  # Fast-fail: lint + unit tests run FIRST before expensive Docker build
+  # LESSON (Issue #3): Don't burn agent minutes on build if tests fail
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: "pip" }
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check . --output-format=github
+      - run: pytest tests/unit/ --cov=src --cov-fail-under=80 -v
+
+  # Helm validation — catch schema renames before ArgoCD deploys
+  # LESSON (Issue #4): values key renamed in chart but not in env overrides
+  helm-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with: { version: "3.13.2" }
+      - run: |
+          helm lint kubernetes/helm/ai-inference -f kubernetes/helm/ai-inference/values-prod.yaml
+          helm template ai-inference kubernetes/helm/ai-inference \
+            -f kubernetes/helm/ai-inference/values-prod.yaml | kubeval --strict
+
+  # Build with Docker layer caching — saves 12+ min per build
+  # LESSON (Issue #3): No caching = 2.3GB pulled fresh every run
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, helm-validate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: eu-west-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ secrets.ECR_REGISTRY }}/ai-inference:sha-${{ github.sha }}
+          cache-from: type=s3,region=eu-west-1,bucket=ai-saas-build-cache,name=ai-inference
+          cache-to: type=s3,region=eu-west-1,bucket=ai-saas-build-cache,name=ai-inference,mode=max
+
+  # Trivy container scan — block CRITICAL/HIGH CVEs (Issue #10 lesson)
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.ECR_REGISTRY }}/ai-inference:sha-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # Golden dataset validation — catch silent model mismatches
+  # LESSON (Issue #8): tiktoken v1 vs v2 mismatch served wrong AI outputs
+  # to 20% of traffic for 4 hours. 18,000 bad responses before noticed.
+  model-validation:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python scripts/validate_model_outputs.py \
+            --image ${{ secrets.ECR_REGISTRY }}/ai-inference:sha-${{ github.sha }} \
+            --golden-dataset s3://ai-saas-golden-datasets/samples.jsonl \
+            --min-match-rate 0.95
