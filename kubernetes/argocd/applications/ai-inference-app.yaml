@@ -1,0 +1,149 @@
+# =============================================================================
+# ai-inference-app.yaml — ArgoCD Application Definition
+#
+# GitOps delivery: ArgoCD watches this file and the kubernetes/manifests/
+# directory. Any merge to main triggers automatic sync to the EKS cluster.
+#
+# Deployment model:
+#   1. Developer merges PR → GitHub Actions CI builds + scans + pushes image
+#   2. CI updates image tag in kubernetes/manifests/ai-inference-deployment.yaml
+#   3. ArgoCD detects git diff within 3 minutes, applies to cluster
+#   4. ArgoCD health checks confirm rollout succeeded
+#
+# Access ArgoCD UI:
+#   kubectl port-forward svc/argocd-server -n argocd 8080:443
+#   https://localhost:8080 (admin / see AWS Secrets Manager: argocd/admin-password)
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-inference
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ai-inference
+    app.kubernetes.io/part-of: ai-saas-platform
+    environment: production
+  annotations:
+    # Notification: Slack #deployments-prod on sync success/failure
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments-prod
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments-prod
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: incidents-prod
+  # Prevent accidental deletion of a production app via kubectl delete
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  project: production
+
+  source:
+    repoURL: https://github.com/kumarrajapuvvalla-bit/aws-ai-saas-devops
+    targetRevision: main
+    path: kubernetes/manifests
+
+    # Kustomize overlay for environment-specific patches
+    kustomize:
+      namePrefix: ""
+      images:
+        - 123456789012.dkr.ecr.eu-west-1.amazonaws.com/ai-inference
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inference
+
+  syncPolicy:
+    automated:
+      prune: true        # Remove resources deleted from Git
+      selfHeal: true     # Re-apply if someone manually edits the cluster
+      allowEmpty: false  # Never wipe namespace if source is empty (safety net)
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true              # Delete old pods AFTER new ones are healthy
+      - RespectIgnoreDifferences=true
+      - ApplyOutOfSyncOnly=true     # Only apply changed resources, not everything
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  # Health assessment: ArgoCD will wait for these resources to be healthy
+  # before marking the sync as complete
+  ignoreDifferences:
+    # Ignore HPA current replica count — it fluctuates with load
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/currentReplicas
+    # Ignore last-applied annotation — managed by kubectl, not ArgoCD
+    - group: ""
+      kind: ServiceAccount
+      jsonPointers:
+        - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration
+
+  revisionHistoryLimit: 5
+
+---
+# ArgoCD AppProject: production isolation
+# Services in this project can only deploy to the production EKS cluster
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: production
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Production AI SaaS platform services"
+
+  sourceRepos:
+    - https://github.com/kumarrajapuvvalla-bit/aws-ai-saas-devops
+    - https://charts.helm.sh/stable
+
+  destinations:
+    - namespace: "inference"
+      server: https://kubernetes.default.svc
+    - namespace: "processing"
+      server: https://kubernetes.default.svc
+    - namespace: "monitoring"
+      server: https://kubernetes.default.svc
+
+  # Restrict which Kubernetes resources this project can create
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "scheduling.k8s.io"
+      kind: PriorityClass
+
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: ConfigMap
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "batch"
+      kind: CronJob
+    - group: "argoproj.io"
+      kind: Application
+
+  # Only cluster admins can manually sync or rollback production
+  roles:
+    - name: deployer
+      description: "CI/CD system role — automated syncs only"
+      policies:
+        - p, proj:production:deployer, applications, sync, production/*, allow
+        - p, proj:production:deployer, applications, get, production/*, allow
+      jwtTokens: []
