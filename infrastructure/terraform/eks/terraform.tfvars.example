@@ -1,0 +1,51 @@
+# =============================================================================
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in real values.
+# NEVER commit terraform.tfvars — it is in .gitignore.
+# =============================================================================
+
+# --- Core Config -------------------------------------------------------
+aws_region   = "eu-west-1"
+project_name = "ai-saas"
+environment  = "prod"  # prod | staging | dev
+
+kubernetes_version = "1.28"
+
+# --- Networking --------------------------------------------------------
+# Retrieve from Terraform VPC module outputs or AWS Console
+vpc_id = "vpc-0abc1234def56789a"
+
+private_subnet_ids = [
+  "subnet-0abc1234def56789b",  # eu-west-1a
+  "subnet-0abc1234def56789c",  # eu-west-1b
+  "subnet-0abc1234def56789d",  # eu-west-1c
+]
+
+# --- Node Groups -------------------------------------------------------
+system_node_instance_type = "m5.xlarge"
+system_node_desired       = 2  # Minimum 2 for HA — do not lower
+
+gpu_node_instance_type = "g4dn.2xlarge"
+gpu_node_desired       = 2
+gpu_node_max           = 10   # Hard cap — see postmortem INC-002
+
+# CPU SPOT pool: multiple types = better availability, fewer interruptions
+cpu_spot_node_instance_types = ["m5.2xlarge", "m5a.2xlarge", "m5d.2xlarge"]
+
+# --- Quotas and Alerts -------------------------------------------------
+# Find current quota: AWS Console > Service Quotas > EC2 > On-Demand P instances
+# Alarm fires at 70% to give runway for quota increase requests
+gpu_vcpu_quota_limit = 96
+
+# SNS topic that routes to PagerDuty + Slack ops channel
+sns_ops_topic_arn = "arn:aws:sns:eu-west-1:123456789012:ai-saas-ops-alerts"
+
+# --- Logging -----------------------------------------------------------
+cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+# --- Tags --------------------------------------------------------------
+tags = {
+  CostCenter  = "engineering"
+  Team        = "platform"
+  ExpiresOn   = "never"
+}
