@@ -1,0 +1,308 @@
+# =============================================================================
+# ai-inference-deployment.yaml
+# GPU inference service — PyTorch model serving on NVIDIA T4 (g4dn.2xlarge)
+#
+# Key decisions documented inline:
+#   - GPU memory limits include 4GB CUDA overhead (INC-007)
+#   - priorityClassName prevents eviction under memory pressure (INC-005)
+#   - serviceAccountName enables IRSA — no EC2 instance role needed (INC-010)
+#   - readinessProbe delays traffic until model is fully loaded (~45s)
+#   - lifecycle preStop gives in-flight requests time to complete
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    environment: production
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-inference
+  namespace: inference
+  labels:
+    app: ai-inference
+    version: "1.0"
+    app.kubernetes.io/name: ai-inference
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/part-of: ai-saas-platform
+  annotations:
+    # Restart policy: ArgoCD will roll this on image tag change
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # Never go below 2 replicas during rollout
+  selector:
+    matchLabels:
+      app: ai-inference
+  template:
+    metadata:
+      labels:
+        app: ai-inference
+        app.kubernetes.io/name: ai-inference
+      annotations:
+        # Prometheus scrape config
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Force pod restart when ConfigMap changes
+        checksum/config: "placeholder-updated-by-helm"
+    spec:
+      # IRSA: pod assumes IAM role via ServiceAccount — no wildcard EC2 instance role
+      # Fix for INC-010: s3:* on Resource:* replaced with scoped read-only access
+      serviceAccountName: ai-inference
+
+      # Taint toleration: GPU nodes have nvidia.com/gpu=true:NoSchedule
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+
+      # Node affinity: schedule ONLY on GPU nodes, not on system/spot nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-type
+                    operator: In
+                    values: ["gpu"]
+        # Spread across AZs: prevent both replicas landing on same AZ
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ai-inference
+                topologyKey: topology.kubernetes.io/zone
+
+      # System-critical priority: prevents eviction under GPU memory pressure
+      # Fix for INC-005: Prometheus was evicted because inference had no PriorityClass
+      priorityClassName: workload-high
+
+      # 60s graceful shutdown: allow in-flight inference requests to complete
+      terminationGracePeriodSeconds: 60
+
+      initContainers:
+        # Download model weights from S3 before starting inference server
+        # Separating model download from serving container enables independent updates
+        - name: model-downloader
+          image: amazon/aws-cli:2.13.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "Downloading model artifacts..."
+              aws s3 sync s3://ai-saas-model-artifacts/models/inference-v2/ /models/                 --only-show-errors
+              echo "Model download complete. Verifying checksum..."
+              sha256sum -c /models/checksums.txt
+              echo "Checksum verified."
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+      containers:
+        - name: ai-inference
+          image: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/ai-inference:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          env:
+            - name: MODEL_PATH
+              value: /models
+            - name: PORT
+              value: "8080"
+            - name: WORKERS
+              value: "1"          # Single worker per GPU — multi-worker causes CUDA context conflicts
+            - name: MAX_BATCH_SIZE
+              value: "16"
+            - name: AWS_REGION
+              value: eu-west-1
+            - name: LOG_LEVEL
+              value: INFO
+            # GPU memory management — fix for INC-007 (OOMKill every 110 minutes)
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "max_split_size_mb:512"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+
+          # Resource limits: model(12GB) + CUDA overhead(4GB) + buffer(4GB) = 20GB
+          # LESSON (INC-007): original limit was 14GB — model loaded fine but CUDA
+          # reserved 4GB on top and triggered OOMKill every ~110 minutes.
+          resources:
+            requests:
+              cpu: "2"
+              memory: "14Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "20Gi"    # Must include CUDA overhead — see INC-007
+              nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: tmp-dir
+              mountPath: /tmp
+
+          # Liveness: if server hangs, restart the pod
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 120   # Model loading takes ~90s on g4dn.2xlarge
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 10
+
+          # Readiness: only route traffic after model is loaded and warm
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 6
+            timeoutSeconds: 5
+
+          # Startup: generous timeout for initial model download + load
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 10
+
+          lifecycle:
+            preStop:
+              exec:
+                # Signal the server to drain in-flight requests before SIGTERM
+                command: ["/bin/sh", "-c", "curl -s -X POST localhost:8080/shutdown/graceful && sleep 15"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: model-storage
+          emptyDir:
+            medium: ""
+            sizeLimit: "30Gi"
+        - name: tmp-dir
+          emptyDir:
+            medium: Memory
+            sizeLimit: "1Gi"
+
+      # DNS config: reduce lookup latency for S3 and ECR calls
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-inference
+  namespace: inference
+  labels:
+    app: ai-inference
+spec:
+  selector:
+    app: ai-inference
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ai-inference-hpa
+  namespace: inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ai-inference
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    # Scale on GPU utilisation — more relevant than CPU for inference workloads
+    - type: Pods
+      pods:
+        metric:
+          name: nvidia_gpu_utilization
+        target:
+          type: AverageValue
+          averageValue: "70"
+    # Secondary scale signal: request queue depth
+    - type: External
+      external:
+        metric:
+          name: sqs_messages_visible
+          selector:
+            matchLabels:
+              queue: inference-jobs
+        target:
+          type: AverageValue
+          averageValue: "5"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 5-min cool-down prevents thrashing
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+# ServiceAccount for IRSA — maps to aws_iam_role.inference in terraform/iam/
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-inference
+  namespace: inference
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ai-saas-inference-irsa
