@@ -1,0 +1,228 @@
+name: "Terraform — Plan & Apply"
+
+# Trigger: plan on every PR, apply only on merge to main
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infrastructure/terraform/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infrastructure/terraform/**"
+
+# Concurrency: prevent parallel applies to the same environment
+# If a plan/apply is running and a new one is triggered, cancel the old one
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel a running apply — wait for it
+
+permissions:
+  id-token: write    # OIDC — zero static AWS credentials anywhere
+  contents: read
+  pull-requests: write   # Post plan output as PR comment
+
+env:
+  TF_VERSION: "1.5.7"
+  AWS_REGION: "eu-west-1"
+  TF_WORKING_DIR: "infrastructure/terraform/eks"
+  # Prevent Terraform from prompting for input
+  TF_IN_AUTOMATION: "true"
+  # Disable colour codes in CI output
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # terraform-validate: fast checks that run on every PR before plan
+  # -------------------------------------------------------------------------
+  validate:
+    name: "Validate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive infrastructure/terraform/
+        # Fail the PR if any .tf file is not formatted — enforces style consistency
+
+      - name: Terraform Init (validate only — no backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: tflint — Check for common mistakes
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.50.0
+      - run: |
+          tflint --init
+          tflint --chdir=${{ env.TF_WORKING_DIR }} --format=compact
+
+  # -------------------------------------------------------------------------
+  # terraform-plan: generate and post plan as PR comment
+  # -------------------------------------------------------------------------
+  plan:
+    name: "Plan"
+    runs-on: ubuntu-latest
+    needs: [validate]
+    environment: production-plan   # Requires reviewer approval in prod environments
+    outputs:
+      plan-exit-code: ${{ steps.plan.outputs.exitcode }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # OIDC auth — no static AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=ai-saas-terraform-state" \
+            -backend-config="key=eks/terraform.tfstate" \
+            -backend-config="region=eu-west-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=terraform-state-lock"
+        # DynamoDB lock prevents concurrent applies — fix for INC-001
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="terraform.tfvars" \
+            -out=tfplan.binary \
+            -detailed-exitcode \
+            2>&1 | tee plan.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Convert plan to readable format
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform show -no-color tfplan.binary > plan-readable.txt
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infrastructure/terraform/eks/plan-readable.txt', 'utf8');
+            const maxLen = 65000;
+            const truncated = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n[... truncated — see workflow run for full output]'
+              : plan;
+            const exitCode = '${{ steps.plan.outputs.exitcode }}';
+            const status = exitCode === '0' ? '✅ No changes' :
+                           exitCode === '2' ? '⚠️ Changes detected' : '❌ Plan failed';
+            const body = `## Terraform Plan — ${status}
+
+<details>
+<summary>Click to expand plan</summary>
+
+\`\`\`hcl
+${truncated}
+\`\`\`
+</details>
+
+*Triggered by @${{ github.actor }} on ${{ github.event.pull_request.head.ref }}*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan.binary
+          retention-days: 7
+
+      - name: Fail if plan errored (exit code 1)
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+  # -------------------------------------------------------------------------
+  # terraform-apply: runs ONLY on merge to main, requires plan to succeed
+  # -------------------------------------------------------------------------
+  apply:
+    name: "Apply"
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.plan.outputs.plan-exit-code == '2'
+    environment: production   # Requires manual approval in GitHub Environments
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=ai-saas-terraform-state" \
+            -backend-config="key=eks/terraform.tfstate" \
+            -backend-config="region=eu-west-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=terraform-state-lock"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan.binary
+
+      - name: Post apply summary to Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "Terraform Apply ${{ job.status == 'success' && '✅ succeeded' || '❌ FAILED' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Apply* ${{ job.status == 'success' && ':white_check_mark: succeeded' || ':x: FAILED' }}\nCommit: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPS_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
